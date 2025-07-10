@@ -1,7 +1,11 @@
 // Import the SpeechRecognitionService
 import SpeechRecognitionService from './services/SpeechRecognitionService';
 import TTSService from './services/TTSService'; // Import TTSService
-import { SpeechManagerConfig, SpeechCallback, UIElements, SpeechState } from './types';
+import { SpeechManagerConfig, SpeechCallback, UIElements, SpeechState, ConversationEntry } from './types'; // Added ConversationEntry
+
+// Define GameState type
+export type GameState = 'idle' | 'initializing' | 'playing' | 'ending' | 'error';
+
 
 // Add a simple Toast class
 class Toast {
@@ -45,43 +49,65 @@ class SpeechToTextManager {
     private lastKnownPosition: number = 0;
 
     // Game state variables
-    private gameActive: boolean = false;
-    private playerCharacter: string | null = null;
-    private gameStartTime: number = 0;
-    private currentStorySegment: string = "";
-    private availableChoices: string[] = [];
-    private choiceFormatCounter: number = 0; // For varying choice formats A/B, A/B/C, Numerical
-    private ttsService: TTSService; // Use TTSService type
-    private expectingCharacterChoice: boolean = false; // New state to track if we are waiting for character choice
+    private gameState: GameState = 'idle';
+    // private gameActive: boolean = false; // Replaced by gameState
+    private playerCharacterName: string | null = null; // Renamed from playerCharacter
+    private gameStartTime: number | null = 0; // Can be null before game starts
+    private currentStoryContext: string = ""; // Renamed from currentStorySegment
+    private lastChoiceOptions: string[] = []; // Renamed from availableChoices
+    private choiceFormatCounter: number = 0;
+    private ttsService: TTSService;
+    // private expectingCharacterChoice: boolean = false; // Replaced by gameState = 'initializing'
     private chatGPTResponseObserver: MutationObserver | null = null;
-    private lastProcessedMessageId: string | null = null; // To avoid processing the same message multiple times
+    private lastProcessedMessageId: string | null = null;
     private gameTimerIntervalId: number | null = null;
     private halfwayWarningGiven: boolean = false;
-    private approachingDenouement: boolean = false; // To signal prompts to guide AI to a conclusion
+    private approachingDenouement: boolean = false;
+    private conversationHistory: ConversationEntry[] = [];
 
-    private updateText(finalText: string, interimText: string): void {
-        if (this.expectingCharacterChoice) {
-            this.processCharacterChoice(finalText.trim());
-            return;
+    // --- ADD THIS HELPER METHOD TO SpeechToTextManager CLASS ---
+    private setChatGPTInput(text: string): void {
+        const chatGPTInput = document.querySelector('textarea[data-testid="text-input"]') as HTMLTextAreaElement ||
+                             document.querySelector('textarea[id="prompt-textarea"]') as HTMLTextAreaElement; // Prioritize data-testid, fallback to id
+        if (chatGPTInput) {
+            chatGPTInput.value = text;
+            // Dispatch an 'input' event to ensure React/framework detects the change
+            chatGPTInput.dispatchEvent(new Event('input', { bubbles: true }));
+            console.log(`Hollywood Noir: Set ChatGPT input to: "${text.substring(0, Math.min(text.length, 50))}..."`);
+        } else {
+            console.warn('Hollywood Noir: Could not find ChatGPT input textarea. Manual input may be required.');
         }
+    }
 
-        // If game is active, player input should be handled by game logic
-        if (this.gameActive) { // Note: expectingCharacterChoice is handled before this block
-            this.processPlayerGameChoice(finalText.trim());
-            return;
-        }
+    // --- MODIFY updateText METHOD ---
+    // Ensure this method now correctly routes input based on gameState
+    // and correctly preserves existing interim text processing if any.
+    updateText(finalText: string, interimText: string) {
+        // Assuming original interimText processing (if any) happens here
+        // If the base class handles interim text, this method might also call super.updateText for interim.
+        // For this implementation, we're focused on the finalText for game logic.
+        // The existing SpeechRecognitionService setup doesn't show a separate interim handler,
+        // it passes both to updateText. We'll just use finalText for decisions.
 
-        // Fallback to original behavior if not in game context (e.g. if game hasn't started or is over)
-        // This part might be removed if the extension is purely for the game.
-        if (!this.elements.textArea || !this.elements.interimDisplay) {
-            // If text area isn't found (e.g. during initial game setup before UI is ready for text input)
-            // we might not want to do anything here or log a specific message.
-            // For now, let's assume it might not be an error if game is starting.
-            if(!this.gameActive && !this.expectingCharacterChoice) {
-                console.log("Textarea not found, but not in active game or expecting choice. Input:", finalText);
+        // Only process final text for game logic or routing
+        if (finalText.length > 0) {
+            if (this.gameState === 'initializing') { // GameState.Initializing
+                // User is making character choice
+                this.processCharacterChoice(finalText.trim());
+            } else if (this.gameState === 'playing') { // GameState.Playing
+                // User is making game choice during active play
+                // No need to push to conversationHistory here, processPlayerGameChoice will do it
+                this.processPlayerGameChoice(finalText.trim());
+            } else { // GameState.Idle, GameState.Ending, GameState.Error, or any other state
+                console.log(`Hollywood Noir: Game is ${this.gameState}. Routing input to normal ChatGPT.`);
+                this.setChatGPTInput(finalText); // Pass input to the main ChatGPT textarea
             }
-            return;
         }
+    }
+
+
+    private toggleSpeech = (event: Event): void => {
+        event.preventDefault();
 
         // Get the current selection
         const selection = window.getSelection();
@@ -195,7 +221,7 @@ class SpeechToTextManager {
             continuous: true,
             interimResults: true,
             onMicActivity: this.handleMicActivity,
-            onEnd: () => this.stopListening(),
+            onEnd: () => this.stopListening(), // This might need gameState check
             onError: this.handleError
         };
 
@@ -203,39 +229,63 @@ class SpeechToTextManager {
             config,
             this.updateText.bind(this)
         );
-        // this.initialize(); // Original initialization
-        this.startGameInitialization(); // New game initialization
+        this.ttsService = new TTSService(); // Instantiate TTS Service early
+        this.initializeGameSetup();
     }
 
-    private async startGameInitialization(): Promise<void> {
-        console.log("Hollywood Noir: Starting game initialization...");
-        // In a real scenario, we would wait for the page to be ready,
-        // potentially show a "Start Game" button or activate on plugin icon click.
-        // For now, we'll directly proceed to playing the introduction.
+    private initializeGameSetup(): void {
+        // This is the new entry point, effectively replacing former startGameInitialization
+        // It sets the game to idle and waits for a trigger.
+        // For now, we'll make it auto-trigger to playIntroduction like before.
+        // In a future step, this could wait for a user command "Start Hollywood Noir".
+        this.gameState = 'idle';
+        this.conversationHistory = [];
+        this.currentStoryContext = "";
+        this.lastChoiceOptions = [];
+        this.playerCharacterName = null;
+        this.gameStartTime = null;
+        this.choiceFormatCounter = 0;
+        this.lastProcessedMessageId = null;
+        this.halfwayWarningGiven = false;
+        this.approachingDenouement = false;
 
-        this.ttsService = new TTSService(); // Instantiate real TTSService
+        console.log("Hollywood Noir: System idle. Ready to start game.");
 
-        // Stop any residual speech from previous sessions/reloads
-        this.ttsService.stop();
-
-        await this.playIntroduction();
-        this.initChatGPTResponseObserver(); // Initialize the observer
+        // Auto-triggering for now to maintain previous flow:
+        this.triggerGameStart();
     }
 
-    private async playIntroduction(): Promise<void> {
+    // New method to explicitly trigger the game start
+    public triggerGameStart(): void {
+        if (this.gameState !== 'idle' && this.gameState !== 'error' && this.gameState !== 'ending') { // allow restart from error/end
+            console.log("Hollywood Noir: Game is already active or initializing.");
+            return;
+        }
+        console.log("Hollywood Noir: Triggering game start...");
+        this.gameState = 'initializing';
+        this.ttsService.stop(); // Stop any residual speech
+        this.playIntroduction(); // This was part of startGameInitialization
+        this.initChatGPTResponseObserver(); // This was also part of startGameInitialization
+    }
+
+
+    private async playIntroduction(): Promise<void> { // Renamed from former playIntroduction
         console.log("Hollywood Noir: Playing introduction...");
-        const introText = "Welcome to Hollywood Noir. Do you wish to play as Philip Marlowe, the famous detective, or a more anonymous gumshoe? Say 'Philip Marlowe' or 'Anonymous Detective'. This is an audio-only game. You have 40 minutes to solve the mystery.";
+        // Using the new intro text from instructions
+        const introText = "Welcome, detective, to Hollywood Noir. In this audio-only mystery, you have exactly forty minutes to unravel a dark secret in the City of Angels. Do you wish to play as Philip Marlowe, the famous detective, or a more anonymous gumshoe? Say 'Philip Marlowe' or 'Anonymous Detective'.";
 
         this.ttsService.speak(introText, () => {
-            console.log("Hollywood Noir: Introduction finished. Listening for character choice...");
-            this.expectingCharacterChoice = true;
-            if (!this.state.isListening && !this.ttsService.isSpeaking()) {
+            console.log("Hollywood Noir: Introduction finished. Listening for character choice.");
+            // gameState is already 'initializing'
+            if (this.gameState === 'initializing' && !this.state.isListening && !this.ttsService.isSpeaking()) {
                  this.startListening().catch(e => console.error("Error starting to listen for character choice:", e));
             }
         });
     }
 
     private processCharacterChoice(choiceText: string): void {
+        if (this.gameState !== 'initializing') return; // Should only process if in this state
+
         const normalizedChoice = choiceText.toLowerCase().replace(/[^a-z0-9\s]/gi, '');
         console.log(`Hollywood Noir: Processing character choice - "${normalizedChoice}"`);
 
@@ -246,122 +296,153 @@ class SpeechToTextManager {
         } else {
             const retryMessage = "Sorry, I didn't catch that. Please say 'Philip Marlowe' or 'Anonymous Detective'.";
             this.ttsService.speak(retryMessage, () => {
-                if (!this.state.isListening && !this.ttsService.isSpeaking()) {
+                if (this.gameState === 'initializing' && !this.state.isListening && !this.ttsService.isSpeaking()) {
                     this.startListening().catch(e => console.error("Error restarting listening for character choice:", e));
                 }
             });
             return;
         }
 
-        this.expectingCharacterChoice = false;
-        this.gameActive = true;
+        this.gameState = 'playing'; // Transition state
         this.gameStartTime = Date.now();
-        this.halfwayWarningGiven = false; // Reset flag
-        this.approachingDenouement = false; // Reset flag
+        this.halfwayWarningGiven = false;
+        this.approachingDenouement = false;
+        this.conversationHistory = []; // Initialize conversation history
 
-        // Ensure mic interface elements are ready for submitting prompts
-        // This was missing from the original plan but it's important from previous steps
+        // Add system message for initial context if desired, or wait for first user/assistant turn.
+        // For now, first prompt will be added by sendGamePromptToChatGPT.
+
         this.setupMicInterface().then(() => {
             console.log(`Hollywood Noir: Character selected - ${this.playerCharacter}. Game started at ${this.gameStartTime}.`);
-            this.startGameTimer(); // Start the game timer
+            this.startGameTimer();
             this.ttsService.speak(`You've chosen to play as ${this.playerCharacter}. The city's shadows await.`, () => {
-                this.sendGamePromptToChatGPT("Start the Hollywood Noir game. The player is ready.");
+                // Send initial prompt based on character
+                let initialPromptContent = "";
+                if (this.playerCharacterName === "Philip Marlowe") {
+                    initialPromptContent = "As Philip Marlowe, I've just been approached by a beautiful, mysterious woman. Describe the scene in my office and present the first two choices for action. Keep it in the style of Raymond Chandler, with hints of romantic tension and underlying danger. Format choices as 'Option A: [description]' and 'Option B: [description]'.";
+                } else { // Anonymous Detective
+                    initialPromptContent = "As an anonymous private eye, a new, perplexing case has just landed on my desk. Describe the initial setup and present the first two choices for action. Keep it in the style of Raymond Chandler, with hints of romantic tension and underlying danger. Format choices as 'Option A: [description]' and 'Option B: [description]'.";
+                }
+                this.sendGamePromptToChatGPT(initialPromptContent, true); // true indicates this is the first game prompt
             });
         }).catch(error => {
             console.error("Hollywood Noir: Error setting up mic interface before starting game.", error);
             this.ttsService.speak("There was an issue setting up. Please reload and try again.", () => {
-                this.gameActive = false; // Can't proceed
+                this.gameState = 'error';
             });
         });
     }
 
-    private startGameTimer(): void {
-        if (this.gameTimerIntervalId) {
-            clearInterval(this.gameTimerIntervalId);
+    // --- MODIFY startGameTimer METHOD ---
+    private startGameTimer() {
+        if (this.gameTimerId) { // Renamed from gameTimerIntervalId
+            clearInterval(this.gameTimerId);
+            this.gameTimerId = null;
         }
-        console.log("Hollywood Noir: Starting game timer.");
-        // Using window.setInterval for clarity with NodeJS types vs browser types
-        this.gameTimerIntervalId = window.setInterval(() => {
-            if (!this.gameActive) {
-                this.stopGameTimer();
+
+        if (!this.gameStartTime) { // Ensure gameStartTime is set
+            console.error("Hollywood Noir: Cannot start timer, gameStartTime is not set.");
+            this.gameState = 'error';
+            return;
+        }
+
+        this.halfwayWarningGiven = false;
+        this.approachingDenouement = false;
+
+        const totalGameDurationMs = 40 * 60 * 1000;
+        const halfwayPointMs = totalGameDurationMs / 2;
+        const denouementTriggerMs = totalGameDurationMs - (5 * 60 * 1000);
+
+        console.log(`Hollywood Noir: Game timer started for ${totalGameDurationMs / 60000} minutes.`);
+
+        this.gameTimerId = setInterval(() => {
+            if (this.gameState !== 'playing') { // GameState.Playing
+                console.log(`Hollywood Noir: Timer stopping as game state is no longer 'Playing' (${this.gameState}).`);
+                if(this.gameTimerId) clearInterval(this.gameTimerId);
+                this.gameTimerId = null;
                 return;
             }
 
-            const elapsedTimeMs = Date.now() - this.gameStartTime;
-            const elapsedMinutes = Math.floor(elapsedTimeMs / (60 * 1000));
+            const elapsed = Date.now() - (this.gameStartTime || Date.now()); // Handle null case for gameStartTime, though it should be set
 
-            // Halfway warning (around 20 minutes)
-            if (elapsedMinutes >= 20 && !this.halfwayWarningGiven) {
+            if (!this.halfwayWarningGiven && elapsed >= halfwayPointMs) {
+                this.ttsService.speak("You're halfway through the mystery, detective. Twenty minutes remain to find your answers.");
                 this.halfwayWarningGiven = true;
-                const halfwayMessage = "You're halfway through the game, with 20 minutes remaining.";
-                console.log("Hollywood Noir: Triggering halfway warning.");
-
-                const wasListening = this.state.isListening;
-                const ttsWasSpeaking = this.ttsService.isSpeaking();
-                if (wasListening) this.stopListening();
-                if (ttsWasSpeaking) this.ttsService.stop(); // Stop current TTS to prioritize warning
-
-                this.ttsService.speak(halfwayMessage, () => {
-                    // Try to resume listening only if it was active and TTS is now done
-                    if (wasListening && !this.state.isListening && !this.ttsService.isSpeaking()) {
-                        this.startListening().catch(e => console.error("Error resuming listening after halfway warning:", e));
-                    }
-                    // If TTS was speaking something else, we don't automatically resume that prior speech.
-                });
+                console.log("Hollywood Noir: Halfway warning given.");
             }
 
-            // Approaching denouement (around 35 minutes)
-            if (elapsedMinutes >= 35 && !this.approachingDenouement) {
+            if (!this.approachingDenouement && elapsed >= denouementTriggerMs) {
                 this.approachingDenouement = true;
-                console.log("Hollywood Noir: Approaching denouement time. Prompts will now guide AI to a conclusion.");
-                // This flag will be used by sendGamePromptToChatGPT in a later step
+                this.ttsService.speak("Time is running out, detective. You feel the threads of the mystery pulling together for a final confrontation.");
+                this.conversationHistory.push({
+                    role: 'user',
+                    content: `[SYSTEM_GUIDANCE]: The game is nearing its end. Bring the current plot to a quick, dramatic conclusion within the next few turns, leading to a final revelation or confrontation. Conclude the narrative within the remaining time. Present clear, final choices for resolution.`
+                });
+                // Re-prompt ChatGPT with this new context.
+                // We need to decide if this system guidance is the *only* thing sent, or if it's appended.
+                // For now, let's assume it's a special prompt. The actual implementation of submitToChatGPT would need to handle this.
+                // A simpler way for now: The next natural prompt from sendGamePromptToChatGPT will include the approachingDenouement flag.
+                // So, we might not need to send an *extra* prompt here, just set the flag.
+                // The prompt modification based on this.approachingDenouement is already in sendGamePromptToChatGPT.
+                console.log("Hollywood Noir: Denouement trigger set. Next prompt will guide AI.");
             }
 
-            // Time's up (40 minutes)
-            if (elapsedMinutes >= 40) {
-                console.log("Hollywood Noir: Time's up!");
-                this.endGame("Time's up, detective. The case runs cold... for now. Game over.");
+            if (elapsed >= totalGameDurationMs) {
+                this.endGame(false);
             }
-        }, 30 * 1000); // Check every 30 seconds
+        }, 1000);
     }
 
-    private stopGameTimer(): void {
-        if (this.gameTimerIntervalId) {
-            clearInterval(this.gameTimerIntervalId);
-            this.gameTimerIntervalId = null;
-            console.log("Hollywood Noir: Game timer stopped.");
-        }
-    }
+    // No need for stopGameTimer as clearInterval is handled within startGameTimer's interval check or endGame.
 
-    // Centralized function to end the game
-    private endGame(endMessage: string): void {
-        if (!this.gameActive && !this.expectingCharacterChoice) { // Avoid multiple calls or if already ended
-            console.log("Hollywood Noir: Game already ended or not active.");
-            return;
-        }
-        console.log("Hollywood Noir: Ending game - ", endMessage);
-        this.stopGameTimer();
-        this.ttsService.stop();
-        this.stopListening();
-        this.gameActive = false;
-        this.expectingCharacterChoice = false; // Reset this too
-
-        // Disconnect observer if it exists
-        if (this.chatGPTResponseObserver) {
-            this.chatGPTResponseObserver.disconnect();
-            this.chatGPTResponseObserver = null;
-            console.log("Hollywood Noir: MutationObserver disconnected.");
+    // --- MODIFY endGame METHOD ---
+    endGame(solved: boolean, customMessage?: string) { // Added customMessage parameter
+        if (this.gameState === 'ending' || this.gameState === 'idle') {
+             console.log("Hollywood Noir: Game is already ending or idle. No action taken.");
+             return;
         }
 
-        this.ttsService.speak(endMessage, () => {
-            // Reset flags
+        console.log(`Hollywood Noir: Ending game. Solved: ${solved}`);
+        this.gameState = 'ending'; // Set state to Ending
+
+        if (this.gameTimerId) { // Clear timer if it's running
+            clearInterval(this.gameTimerId);
+            this.gameTimerId = null;
+        }
+
+        this.ttsService.stop(); // Stop any ongoing TTS
+        this.stopListening();   // Stop any ongoing speech recognition
+
+        let finalMessage = customMessage || "";
+        if (!customMessage) { // Use default messages if no custom one provided
+            if (solved) {
+                finalMessage = "Congratulations, detective! You've cracked the case and brought the truth to light. The city sleeps a little safer tonight. Game over.";
+            } else {
+                finalMessage = "Time has run out, detective. The mystery remains unsolved, and shadows linger in the alleys of Hollywood. Perhaps another time. Game over.";
+            }
+        }
+
+        this.ttsService.speak(finalMessage, () => {
+            this.gameState = 'idle';
+            this.playerCharacterName = null;
+            this.gameStartTime = null;
+            this.currentStoryContext = '';
+            this.lastChoiceOptions = [];
+            this.conversationHistory = [];
             this.halfwayWarningGiven = false;
             this.approachingDenouement = false;
-            this.currentStorySegment = "";
-            this.availableChoices = [];
-            this.lastProcessedMessageId = null;
-            // Consider resetting UI if visual suppression was very aggressive
-            this.injectStyles(); // Re-inject styles to remove game-active suppression
+            this.choiceFormatCounter = 0; // Reset choice counter
+            this.lastProcessedMessageId = null; // Reset last processed message ID
+
+            if (this.chatGPTResponseObserver) { // Disconnect observer
+                this.chatGPTResponseObserver.disconnect();
+                this.chatGPTResponseObserver = null; // Good practice to nullify
+                console.log("Hollywood Noir: MutationObserver disconnected.");
+            }
+
+            this.injectStyles(); // Re-inject styles to remove game-active suppression if any
+            console.log("Hollywood Noir: Game state fully reset to Idle.");
+            // Potentially offer a way to start a new game, e.g. listen for "start game" again.
         });
     }
 
@@ -382,7 +463,7 @@ class SpeechToTextManager {
         const textarea = await this.findTextarea();
         if (!textarea) {
             this.ttsService.speak("There was a problem communicating with the story engine. Please try reloading the page.", () => {});
-            this.gameActive = false; // Stop the game if we can't interact
+            this.gameState = 'error'; // Stop the game if we can't interact
             return;
         }
 

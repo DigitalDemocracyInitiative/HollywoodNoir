@@ -20,4 +20,9 @@ export interface SpeechState {
     lastStopTime: number;
 }
 
+export interface ConversationEntry {
+    role: 'user' | 'assistant' | 'system';
+    content: string;
+}
+
 export type SpeechCallback = (finalText: string, interimText: string) => void;
